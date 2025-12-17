@@ -1,13 +1,16 @@
 use anyhow::anyhow;
 use clap::Parser;
 use futures::stream::{self, StreamExt};
+use indicatif::ProgressBar;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek};
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
+use std::thread;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 
 #[derive(Parser)]
@@ -55,7 +58,7 @@ async fn main() {
     let mut ips = File::open(cli.inputfile).expect("Can't read the file");
     let reader = BufReader::new(&ips);
 
-    let mut line_number: u128 = 0;
+    let mut line_number: u64 = 0;
     let reader_iter = reader.lines().map(|x| {
         line_number += 1;
         x.as_ref().unwrap().parse::<SocketAddrV4>().expect(
@@ -72,12 +75,42 @@ async fn main() {
     ips.seek(std::io::SeekFrom::Start(0)).unwrap();
     let reader = BufReader::new(&ips);
 
+    let (tx, mut rx) = mpsc::channel(cli.rate);
+    let handle = thread::spawn(move || {
+        let mut pb = ProgressBar::new(line_number);
+        if cli.verbose {
+            pb = ProgressBar::hidden();
+        }
+        while let Some(update) = rx.blocking_recv() {
+            if let Some(inner_value) = update {
+                pb.suspend(|| {
+                    println!("{inner_value}");
+                })
+            }
+            pb.inc(1);
+        }
+        pb.finish();
+    });
+
     stream::iter(reader.lines())
         .map(|ip| scan(ip.unwrap().parse().unwrap(), cli.timeout, cli.verbose))
         .buffer_unordered(cli.rate)
-        .filter_map(|res| async move { res.ok() })
+        .filter_map(|res| {
+            let tx_clone = tx.clone();
+            async move {
+                if let Ok(value) = res {
+                    tx_clone.send(Some(value)).await.unwrap();
+                } else {
+                    tx_clone.send(None).await.unwrap();
+                }
+                res.ok()
+            }
+        })
         .collect::<Vec<SocketAddrV4>>()
         .await;
+
+    drop(tx);
+    handle.join().unwrap();
 }
 
 async fn scan(
@@ -109,24 +142,20 @@ async fn scan(
             let neg_type = response[11];
             if neg_type == 0x02 {
                 // RDP_NEG_RESPONSE
-                println!("{socket}");
                 return Ok(socket);
             } else if neg_type == 0x03 {
                 // RDP_NEG_FAILURE
                 match response[15] {
                     1 => {
                         // SSL_REQUIRED_BY_SERVER
-                        println!("{socket}");
                         return Ok(socket);
                     }
                     2 => {
                         // SSL_NOT_ALLOWED_BY_SERVER
-                        println!("{socket}");
                         return Ok(socket);
                     }
                     5 => {
                         // HYBRID_REQUIRED_BY_SERVER
-                        println!("{socket}");
                         return Ok(socket);
                     }
                     _ => {
